@@ -1,0 +1,8 @@
+backend/akidodo.db
+backend/akidodo_posts.db
+backend/uploads/
+.env
+.env.local
+__pycache__/
+*.pyc
+venv/
