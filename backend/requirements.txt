@@ -1,6 +1,7 @@
 fastapi==0.109.0
-   uvicorn==0.27.0
-   python-dotenv==1.0.0
-   httpx==0.26.0
-   python-multipart==0.0.7
-   pydantic==2.6.0
+uvicorn==0.27.0
+python-dotenv==1.0.0
+httpx==0.26.0
+python-multipart==0.0.7
+pydantic==2.7.0
+pydantic-core==2.23.1
