@@ -4,21 +4,22 @@ import asyncio
 import json
 import os
 import re
+import sqlite3
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import asyncpg
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 
 BASE_DIR = Path(__file__).resolve().parent
 ROOT_DIR = BASE_DIR.parent
+DB_PATH = BASE_DIR / "akidodo_posts.db"
 
 load_dotenv(ROOT_DIR / ".env")
 load_dotenv(ROOT_DIR / ".env.local")
@@ -28,7 +29,6 @@ PUBLIC_BOT_TOKEN = os.getenv("TELEGRAM_PUBLIC_BOT_TOKEN", "").strip()
 PUBLIC_BOT_USERNAME = os.getenv("PUBLIC_BOT_USERNAME", "").strip()
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "").strip()
 SITE_PUBLIC_URL = os.getenv("SITE_PUBLIC_URL", "http://localhost:3000").strip()
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 _raw_owner_ids = os.getenv("TELEGRAM_OWNER_CHAT_ID", "").strip()
 OWNER_CHAT_IDS: list[str] = [cid.strip() for cid in _raw_owner_ids.split(",") if cid.strip()]
@@ -36,7 +36,6 @@ OWNER_CHAT_ID = OWNER_CHAT_IDS[0] if OWNER_CHAT_IDS else ""
 
 LINK_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 
-db_pool: asyncpg.Pool | None = None
 
 app = FastAPI(title="AkiDoDo Public Board API")
 app.add_middleware(
@@ -48,91 +47,66 @@ app.add_middleware(
 )
 
 
-async def get_db():
-    """Получить соединение из пула."""
-    return await db_pool.acquire()
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
-async def init_db_pool() -> None:
-    """Инициализировать пул подключений к PostgreSQL."""
-    global db_pool
-    if not DATABASE_URL:
-        print("WARNING: DATABASE_URL not set, using fallback mode")
-        return
-    try:
-        db_pool = await asyncpg.create_pool(
-            DATABASE_URL,
-            min_size=1,
-            max_size=5,
-            command_timeout=10,
-            timeout=10,
-        )
-        await create_tables()
-        print("Database pool initialized successfully")
-    except Exception as e:
-        print(f"Failed to initialize database pool: {e}")
-        raise
+def new_id() -> str:
+    return str(uuid.uuid4())
 
 
-async def close_db_pool() -> None:
-    """Закрыть пул подключений."""
-    global db_pool
-    if db_pool:
-        await db_pool.close()
+def connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
-async def create_tables() -> None:
-    """Создать таблицы если их нет."""
-    async with db_pool.acquire() as conn:
-        await conn.execute(
+def init_db() -> None:
+    with connect() as conn:
+        conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS posts (
                 id TEXT PRIMARY KEY,
-                telegram_message_id BIGINT UNIQUE,
+                telegram_message_id INTEGER UNIQUE,
                 title TEXT,
                 content TEXT NOT NULL,
                 links TEXT NOT NULL DEFAULT '[]',
                 source TEXT NOT NULL DEFAULT 'owner_bot',
-                is_published BOOLEAN NOT NULL DEFAULT TRUE,
+                is_published INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
-            )
-            """
-        )
-        await conn.execute(
-            """
+            );
+
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
-            )
+            );
             """
         )
 
 
-async def get_setting(key: str, default: str = "0") -> str:
-    """Получить значение из settings."""
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT value FROM settings WHERE key = $1", key)
+def get_setting(key: str, default: str = "0") -> str:
+    with connect() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
     return row["value"] if row else default
 
 
-async def set_setting(key: str, value: str) -> None:
-    """Установить значение в settings."""
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT(key) DO UPDATE SET value = $2",
-            key,
-            value,
+def set_setting(key: str, value: str) -> None:
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO settings (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, value),
         )
 
 
 def extract_post_text(message: dict[str, Any]) -> str:
     return (message.get("text") or message.get("caption") or "").strip()
 
-
 def extract_links(content: str) -> list[str]:
     return [link.rstrip(").,;") for link in LINK_RE.findall(content)]
-
 
 def title_from(content: str) -> str:
     first_line = next((line.strip() for line in content.splitlines() if line.strip()), "")
@@ -140,8 +114,7 @@ def title_from(content: str) -> str:
         return f"{first_line[:87]}..."
     return first_line or "Новая заметка"
 
-
-def post_from_row(row: asyncpg.Record) -> dict[str, Any]:
+def post_from_row(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "id": row["id"],
         "telegram_message_id": row["telegram_message_id"],
@@ -149,62 +122,54 @@ def post_from_row(row: asyncpg.Record) -> dict[str, Any]:
         "content": row["content"],
         "links": json.loads(row["links"] or "[]"),
         "source": row["source"],
-        "is_published": row["is_published"],
+        "is_published": bool(row["is_published"]),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
 
 
-async def create_post(content: str, telegram_message_id: int | None = None) -> dict[str, Any]:
-    post_id = str(uuid.uuid4())
-    created = datetime.now(timezone.utc).isoformat()
+def create_post(content: str, telegram_message_id: int | None = None) -> dict[str, Any]:
+    post_id = new_id()
+    created = now()
     links = extract_links(content)
-
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow(
+    with connect() as conn:
+        conn.execute(
             """
-            INSERT INTO posts (id, telegram_message_id, title, content, links, source, is_published, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            RETURNING *
+            INSERT INTO posts
+            (id, telegram_message_id, title, content, links, source, is_published, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            post_id,
-            telegram_message_id,
-            title_from(content),
-            content,
-            json.dumps(links, ensure_ascii=False),
-            "owner_bot",
-            True,
-            created,
-            created,
+            (
+                post_id, telegram_message_id, title_from(content), content,
+                json.dumps(links, ensure_ascii=False), "owner_bot", 1, created, created,
+            ),
         )
+        row = connect().execute("SELECT * FROM posts WHERE id = ?", (post_id,)).fetchone()
     return post_from_row(row)
 
 
-async def update_post_by_message(telegram_message_id: int, content: str) -> dict[str, Any] | None:
+def update_post_by_message(telegram_message_id: int, content: str) -> dict[str, Any] | None:
     links = extract_links(content)
-    updated = datetime.now(timezone.utc).isoformat()
-
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow(
+    with connect() as conn:
+        conn.execute(
             """
             UPDATE posts
-            SET title = $1, content = $2, links = $3, updated_at = $4
-            WHERE telegram_message_id = $5
-            RETURNING *
+            SET title = ?, content = ?, links = ?, updated_at = ?
+            WHERE telegram_message_id = ?
             """,
-            title_from(content),
-            content,
-            json.dumps(links, ensure_ascii=False),
-            updated,
-            telegram_message_id,
+            (title_from(content), content, json.dumps(links, ensure_ascii=False), now(), telegram_message_id),
         )
+        row = conn.execute(
+            "SELECT * FROM posts WHERE telegram_message_id = ?",
+            (telegram_message_id,),
+        ).fetchone()
     return post_from_row(row) if row else None
 
 
-async def delete_post(post_id: str) -> bool:
-    async with db_pool.acquire() as conn:
-        result = await conn.execute("DELETE FROM posts WHERE id = $1", post_id)
-    return result != "DELETE 0"
+def delete_post(post_id: str) -> bool:
+    with connect() as conn:
+        cursor = conn.execute("DELETE FROM posts WHERE id = ?", (post_id,))
+    return cursor.rowcount > 0
 
 
 async def telegram_api(token: str, method: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -232,9 +197,7 @@ async def send_owner_message(text: str) -> None:
 
 
 async def answer(token: str, chat_id: int | str, text: str) -> None:
-    await telegram_api(
-        token, "sendMessage", {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
-    )
+    await telegram_api(token, "sendMessage", {"chat_id": chat_id, "text": text, "disable_web_page_preview": True})
 
 
 def is_owner(message: dict[str, Any]) -> bool:
@@ -253,17 +216,16 @@ async def handle_owner_message(message: dict[str, Any]) -> None:
 
     if text.startswith("/start"):
         await answer(
-            OWNER_BOT_TOKEN,
-            chat_id,
+            OWNER_BOT_TOKEN, chat_id,
             "Отправь мне текст заметки, и я опубликую её на сайте.\nКоманды:\n/list — последние посты\n/delete ID — удалить пост",
         )
         return
 
     if text.startswith("/list"):
-        async with db_pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT id, title FROM posts WHERE is_published = TRUE ORDER BY created_at DESC LIMIT 10"
-            )
+        with connect() as conn:
+            rows = conn.execute(
+                "SELECT id, title FROM posts WHERE is_published = 1 ORDER BY created_at DESC LIMIT 10"
+            ).fetchall()
         if not rows:
             await answer(OWNER_BOT_TOKEN, chat_id, "Пока нет опубликованных заметок.")
             return
@@ -276,7 +238,7 @@ async def handle_owner_message(message: dict[str, Any]) -> None:
         if len(parts) != 2:
             await answer(OWNER_BOT_TOKEN, chat_id, "Формат: /delete ID")
             return
-        removed = await delete_post(parts[1].strip())
+        removed = delete_post(parts[1].strip())
         await answer(OWNER_BOT_TOKEN, chat_id, "Удалено с сайта." if removed else "Пост не найден.")
         return
 
@@ -284,7 +246,7 @@ async def handle_owner_message(message: dict[str, Any]) -> None:
         await answer(OWNER_BOT_TOKEN, chat_id, "Пока поддерживаются текстовые заметки и подписи к медиа.")
         return
 
-    post = await create_post(text, message.get("message_id"))
+    post = create_post(text, message.get("message_id"))
     await answer(OWNER_BOT_TOKEN, chat_id, f"Опубликовано на сайте.\nID: {post['id']}\n{SITE_PUBLIC_URL}")
 
 
@@ -292,7 +254,7 @@ async def handle_owner_edit(message: dict[str, Any]) -> None:
     text = extract_post_text(message)
     if not text or not is_owner(message):
         return
-    post = await update_post_by_message(message.get("message_id"), text)
+    post = update_post_by_message(message.get("message_id"), text)
     if post:
         await answer(OWNER_BOT_TOKEN, message["chat"]["id"], f"Пост обновлён.\nID: {post['id']}")
 
@@ -304,7 +266,10 @@ async def handle_public_message(message: dict[str, Any]) -> None:
     text = extract_post_text(message)
 
     if text.startswith("/start"):
-        await answer(PUBLIC_BOT_TOKEN, chat_id, "Напишите сообщение автору. Я передам его владельцу AkiDoDo.")
+        await answer(
+            PUBLIC_BOT_TOKEN, chat_id,
+            "Напишите сообщение автору. Я передам его владельцу AkiDoDo.",
+        )
         return
 
     username = sender.get("username")
@@ -315,7 +280,7 @@ async def handle_public_message(message: dict[str, Any]) -> None:
 
 
 async def clear_pending_updates(token: str, setting_key: str) -> None:
-    if await get_setting(setting_key, "0") != "0":
+    if get_setting(setting_key, "0") != "0":
         return
     try:
         result = await telegram_api(token, "getUpdates", {"timeout": 0})
@@ -323,7 +288,7 @@ async def clear_pending_updates(token: str, setting_key: str) -> None:
         if updates:
             latest_id = updates[-1]["update_id"]
             await telegram_api(token, "getUpdates", {"offset": latest_id + 1, "timeout": 0})
-            await set_setting(setting_key, str(latest_id))
+            set_setting(setting_key, str(latest_id))
             print(f"[{setting_key}] Пропущено {len(updates)} сообщений")
         else:
             print(f"[{setting_key}] Нет накопленных сообщений")
@@ -334,15 +299,13 @@ async def clear_pending_updates(token: str, setting_key: str) -> None:
 async def poll_bot(token: str, setting_key: str, handler, edit_handler=None) -> None:
     while True:
         try:
-            offset_val = await get_setting(setting_key, "0")
-            offset = int(offset_val)
+            offset = int(get_setting(setting_key, "0"))
             result = await telegram_api(
-                token,
-                "getUpdates",
+                token, "getUpdates",
                 {"offset": offset + 1, "timeout": 25, "allowed_updates": ["message", "edited_message"]},
             )
             for update in result.get("result", []):
-                await set_setting(setting_key, str(update["update_id"]))
+                set_setting(setting_key, str(update["update_id"]))
                 if "message" in update:
                     await handler(update["message"])
                 elif edit_handler and "edited_message" in update:
@@ -355,7 +318,7 @@ async def poll_bot(token: str, setting_key: str, handler, edit_handler=None) -> 
 
 @app.on_event("startup")
 async def on_startup() -> None:
-    await init_db_pool()
+    init_db()
     if OWNER_BOT_TOKEN and OWNER_CHAT_IDS:
         await clear_pending_updates(OWNER_BOT_TOKEN, "owner_bot_offset")
         asyncio.create_task(
@@ -363,12 +326,9 @@ async def on_startup() -> None:
         )
     if PUBLIC_BOT_TOKEN and OWNER_CHAT_IDS:
         await clear_pending_updates(PUBLIC_BOT_TOKEN, "public_bot_offset")
-        asyncio.create_task(poll_bot(PUBLIC_BOT_TOKEN, "public_bot_offset", handle_public_message))
-
-
-@app.on_event("shutdown")
-async def on_shutdown() -> None:
-    await close_db_pool()
+        asyncio.create_task(
+            poll_bot(PUBLIC_BOT_TOKEN, "public_bot_offset", handle_public_message)
+        )
 
 
 class ManualPost(BaseModel):
@@ -381,34 +341,36 @@ def root() -> dict[str, str]:
 
 
 @app.get("/posts")
-async def list_posts() -> list[dict[str, Any]]:
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT * FROM posts WHERE is_published = TRUE ORDER BY created_at DESC")
+def list_posts() -> list[dict[str, Any]]:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM posts WHERE is_published = 1 ORDER BY created_at DESC"
+        ).fetchall()
     return [post_from_row(row) for row in rows]
 
 
 @app.post("/posts")
-async def add_manual_post(data: ManualPost, x_admin_secret: str | None = Header(default=None)) -> dict[str, Any]:
+def add_manual_post(data: ManualPost, x_admin_secret: str | None = Header(default=None)) -> dict[str, Any]:
     if not ADMIN_SECRET or x_admin_secret != ADMIN_SECRET:
         raise HTTPException(status_code=403, detail="Admin secret required")
     if not data.content.strip():
         raise HTTPException(status_code=400, detail="Content is required")
-    return await create_post(data.content.strip(), None)
+    return create_post(data.content.strip(), None)
 
 
 @app.delete("/posts/{post_id}")
-async def delete_manual_post(post_id: str, x_admin_secret: str | None = Header(default=None)) -> dict[str, bool]:
+def delete_manual_post(post_id: str, x_admin_secret: str | None = Header(default=None)) -> dict[str, bool]:
     if not ADMIN_SECRET or x_admin_secret != ADMIN_SECRET:
         raise HTTPException(status_code=403, detail="Admin secret required")
-    return {"ok": await delete_post(post_id)}
+    return {"ok": delete_post(post_id)}
 
 
 @app.get("/status")
-async def status() -> dict[str, Any]:
+def status() -> dict[str, Any]:
     return {
         "owner_bot_configured": bool(OWNER_BOT_TOKEN and OWNER_CHAT_IDS),
         "owner_ids_count": len(OWNER_CHAT_IDS),
         "public_bot_configured": bool(PUBLIC_BOT_TOKEN and OWNER_CHAT_IDS),
         "public_bot_username": PUBLIC_BOT_USERNAME,
-        "database": "postgresql",
+        "database": "sqlite",
     }
