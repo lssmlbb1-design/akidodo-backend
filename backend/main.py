@@ -24,21 +24,21 @@ DB_PATH = BASE_DIR / "akidodo_posts.db"
 load_dotenv(ROOT_DIR / ".env")
 load_dotenv(ROOT_DIR / ".env.local")
 
-OWNER_BOT_TOKEN = os.getenv("TELEGRAM_OWNER_BOT_TOKEN", "").strip()
+OWNER_BOT_TOKEN  = os.getenv("TELEGRAM_OWNER_BOT_TOKEN", "").strip()
 PUBLIC_BOT_TOKEN = os.getenv("TELEGRAM_PUBLIC_BOT_TOKEN", "").strip()
-OWNER_CHAT_ID = os.getenv("TELEGRAM_OWNER_CHAT_ID", "").strip()
 PUBLIC_BOT_USERNAME = os.getenv("PUBLIC_BOT_USERNAME", "").strip()
-ADMIN_SECRET = os.getenv("ADMIN_SECRET", "").strip()
-SITE_PUBLIC_URL = os.getenv("SITE_PUBLIC_URL", "http://localhost:3000").strip()
+ADMIN_SECRET     = os.getenv("ADMIN_SECRET", "").strip()
+SITE_PUBLIC_URL  = os.getenv("SITE_PUBLIC_URL", "http://localhost:3000").strip()
+
+# Поддержка нескольких владельцев: "8449696490,1480121001" → ['8449696490', '1480121001']
+_raw_owner_ids = os.getenv("TELEGRAM_OWNER_CHAT_ID", "").strip()
+OWNER_CHAT_IDS: list[str] = [cid.strip() for cid in _raw_owner_ids.split(",") if cid.strip()]
+OWNER_CHAT_ID = OWNER_CHAT_IDS[0] if OWNER_CHAT_IDS else ""  # основной ID (для отправки)
 
 LINK_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 
 
 app = FastAPI(title="AkiDoDo Public Board API")
-
-# FIX 1: CORS — было захардкожено на старый preview URL, теперь открыто для всех.
-# allow_credentials=False обязателен при allow_origins=["*"].
-# Для этого публичного API (без cookies) это безопасно.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -51,10 +51,8 @@ app.add_middleware(
 def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-
 def new_id() -> str:
     return str(uuid.uuid4())
-
 
 def connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
@@ -106,17 +104,14 @@ def set_setting(key: str, value: str) -> None:
 def extract_post_text(message: dict[str, Any]) -> str:
     return (message.get("text") or message.get("caption") or "").strip()
 
-
 def extract_links(content: str) -> list[str]:
     return [link.rstrip(").,;") for link in LINK_RE.findall(content)]
-
 
 def title_from(content: str) -> str:
     first_line = next((line.strip() for line in content.splitlines() if line.strip()), "")
     if len(first_line) > 90:
         return f"{first_line[:87]}..."
     return first_line or "Новая заметка"
-
 
 def post_from_row(row: sqlite3.Row) -> dict[str, Any]:
     return {
@@ -144,15 +139,8 @@ def create_post(content: str, telegram_message_id: int | None = None) -> dict[st
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                post_id,
-                telegram_message_id,
-                title_from(content),
-                content,
-                json.dumps(links, ensure_ascii=False),
-                "owner_bot",
-                1,
-                created,
-                created,
+                post_id, telegram_message_id, title_from(content), content,
+                json.dumps(links, ensure_ascii=False), "owner_bot", 1, created, created,
             ),
         )
         row = conn.execute("SELECT * FROM posts WHERE id = ?", (post_id,)).fetchone()
@@ -171,8 +159,7 @@ def update_post_by_message(telegram_message_id: int, content: str) -> dict[str, 
             (title_from(content), content, json.dumps(links, ensure_ascii=False), now(), telegram_message_id),
         )
         row = conn.execute(
-            "SELECT * FROM posts WHERE telegram_message_id = ?",
-            (telegram_message_id,),
+            "SELECT * FROM posts WHERE telegram_message_id = ?", (telegram_message_id,)
         ).fetchone()
     return post_from_row(row) if row else None
 
@@ -194,13 +181,18 @@ async def telegram_api(token: str, method: str, payload: dict[str, Any] | None =
 
 
 async def send_owner_message(text: str) -> None:
-    if not OWNER_BOT_TOKEN or not OWNER_CHAT_ID:
+    """Пересылает сообщение читателей ВСЕМ владельцам из списка."""
+    if not OWNER_BOT_TOKEN or not OWNER_CHAT_IDS:
         return
-    await telegram_api(
-        OWNER_BOT_TOKEN,
-        "sendMessage",
-        {"chat_id": OWNER_CHAT_ID, "text": text, "disable_web_page_preview": True},
-    )
+    for chat_id in OWNER_CHAT_IDS:
+        try:
+            await telegram_api(
+                OWNER_BOT_TOKEN,
+                "sendMessage",
+                {"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
+            )
+        except Exception as exc:
+            print(f"send_owner_message → {chat_id} failed: {exc}")
 
 
 async def answer(token: str, chat_id: int | str, text: str) -> None:
@@ -208,8 +200,10 @@ async def answer(token: str, chat_id: int | str, text: str) -> None:
 
 
 def is_owner(message: dict[str, Any]) -> bool:
+    """Проверяет что отправитель — один из владельцев (поддерживает несколько ID)."""
     sender = message.get("from") or {}
-    return bool(OWNER_CHAT_ID and str(sender.get("id")) == str(OWNER_CHAT_ID))
+    sender_id = str(sender.get("id", ""))
+    return bool(sender_id and sender_id in OWNER_CHAT_IDS)
 
 
 async def handle_owner_message(message: dict[str, Any]) -> None:
@@ -222,12 +216,11 @@ async def handle_owner_message(message: dict[str, Any]) -> None:
 
     if text.startswith("/start"):
         await answer(
-            OWNER_BOT_TOKEN,
-            chat_id,
+            OWNER_BOT_TOKEN, chat_id,
             "Отправь мне текст заметки, и я опубликую её на сайте.\n"
             "Команды:\n"
-            "/list - последние посты\n"
-            "/delete ID - удалить пост с сайта",
+            "/list — последние посты\n"
+            "/delete ID — удалить пост с сайта",
         )
         return
 
@@ -239,8 +232,8 @@ async def handle_owner_message(message: dict[str, Any]) -> None:
         if not rows:
             await answer(OWNER_BOT_TOKEN, chat_id, "Пока нет опубликованных заметок.")
             return
-        lines = [f"{row['id']} - {row['title']}" for row in rows]
-        await answer(OWNER_BOT_TOKEN, chat_id, "\n".join(lines))
+        lines = [f"{row['id']}\n  {row['title']}" for row in rows]
+        await answer(OWNER_BOT_TOKEN, chat_id, "\n\n".join(lines))
         return
 
     if text.startswith("/delete"):
@@ -258,8 +251,7 @@ async def handle_owner_message(message: dict[str, Any]) -> None:
 
     post = create_post(text, message.get("message_id"))
     await answer(
-        OWNER_BOT_TOKEN,
-        chat_id,
+        OWNER_BOT_TOKEN, chat_id,
         f"Опубликовано на сайте.\nID: {post['id']}\n{SITE_PUBLIC_URL}",
     )
 
@@ -281,8 +273,7 @@ async def handle_public_message(message: dict[str, Any]) -> None:
 
     if text.startswith("/start"):
         await answer(
-            PUBLIC_BOT_TOKEN,
-            chat_id,
+            PUBLIC_BOT_TOKEN, chat_id,
             "Напишите сообщение автору. Я передам его владельцу AkiDoDo.",
         )
         return
@@ -294,25 +285,18 @@ async def handle_public_message(message: dict[str, Any]) -> None:
     await answer(PUBLIC_BOT_TOKEN, chat_id, "Сообщение передано автору.")
 
 
-# FIX 2: Пропуск накопленных сообщений при холодном старте.
-# Если offset = 0 (свежая БД после перезапуска), получаем последний update_id
-# и сохраняем его как стартовую точку — все старые сообщения игнорируются.
 async def clear_pending_updates(token: str, setting_key: str) -> None:
+    """Пропускает накопленные сообщения при холодном старте (свежая БД)."""
     if get_setting(setting_key, "0") != "0":
-        return  # offset уже есть — всё хорошо, бот помнит где остановился
+        return
     try:
-        result = await telegram_api(
-            token, "getUpdates", {"offset": -1, "limit": 1, "timeout": 0}
-        )
+        result = await telegram_api(token, "getUpdates", {"offset": -1, "limit": 1, "timeout": 0})
         updates = result.get("result", [])
         if updates:
             latest_id = updates[-1]["update_id"]
-            # Подтверждаем Telegram что прочитали до latest_id
-            await telegram_api(
-                token, "getUpdates", {"offset": latest_id + 1, "limit": 1, "timeout": 0}
-            )
+            await telegram_api(token, "getUpdates", {"offset": latest_id + 1, "limit": 1, "timeout": 0})
             set_setting(setting_key, str(latest_id))
-            print(f"[{setting_key}] Пропущены накопленные сообщения, старт с update_id {latest_id + 1}")
+            print(f"[{setting_key}] Пропущены накопленные сообщения, старт с {latest_id + 1}")
         else:
             print(f"[{setting_key}] Нет накопленных сообщений")
     except Exception as exc:
@@ -324,8 +308,7 @@ async def poll_bot(token: str, setting_key: str, handler, edit_handler=None) -> 
         try:
             offset = int(get_setting(setting_key, "0"))
             result = await telegram_api(
-                token,
-                "getUpdates",
+                token, "getUpdates",
                 {"offset": offset + 1, "timeout": 25, "allowed_updates": ["message", "edited_message"]},
             )
             for update in result.get("result", []):
@@ -337,23 +320,18 @@ async def poll_bot(token: str, setting_key: str, handler, edit_handler=None) -> 
         except Exception as exc:
             err_str = str(exc)
             print(f"Telegram polling error for {setting_key}: {exc}")
-            # FIX 3: При 409 (два экземпляра бота) ждём дольше чтобы старый успел остановиться
-            if "409" in err_str:
-                print(f"[{setting_key}] 409 Conflict — другой экземпляр ещё работает, жду 30 сек...")
-                await asyncio.sleep(30)
-            else:
-                await asyncio.sleep(5)
+            await asyncio.sleep(30 if "409" in err_str else 5)
 
 
 @app.on_event("startup")
 async def on_startup() -> None:
     init_db()
-    if OWNER_BOT_TOKEN and OWNER_CHAT_ID:
+    if OWNER_BOT_TOKEN and OWNER_CHAT_IDS:
         await clear_pending_updates(OWNER_BOT_TOKEN, "owner_bot_offset")
         asyncio.create_task(
             poll_bot(OWNER_BOT_TOKEN, "owner_bot_offset", handle_owner_message, handle_owner_edit)
         )
-    if PUBLIC_BOT_TOKEN and OWNER_CHAT_ID:
+    if PUBLIC_BOT_TOKEN and OWNER_CHAT_IDS:
         await clear_pending_updates(PUBLIC_BOT_TOKEN, "public_bot_offset")
         asyncio.create_task(
             poll_bot(PUBLIC_BOT_TOKEN, "public_bot_offset", handle_public_message)
@@ -364,7 +342,6 @@ class ManualPost(BaseModel):
     content: str
 
 
-# FIX 4: Корневой маршрут GET / — UptimeRobot и Render health-check ожидают 200, а не 404
 @app.get("/")
 def root() -> dict[str, str]:
     return {"status": "ok", "service": "AkiDoDo Backend"}
@@ -398,8 +375,8 @@ def delete_manual_post(post_id: str, x_admin_secret: str | None = Header(default
 @app.get("/status")
 def status() -> dict[str, Any]:
     return {
-        "owner_bot_configured": bool(OWNER_BOT_TOKEN and OWNER_CHAT_ID),
-        "public_bot_configured": bool(PUBLIC_BOT_TOKEN and OWNER_CHAT_ID),
+        "owner_bot_configured": bool(OWNER_BOT_TOKEN and OWNER_CHAT_IDS),
+        "owner_ids_count": len(OWNER_CHAT_IDS),
+        "public_bot_configured": bool(PUBLIC_BOT_TOKEN and OWNER_CHAT_IDS),
         "public_bot_username": PUBLIC_BOT_USERNAME,
-        "delete_note": "Telegram Bot API does not send private-chat delete events. Use /delete ID in the owner bot.",
     }
