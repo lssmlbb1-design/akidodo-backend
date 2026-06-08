@@ -35,10 +35,14 @@ LINK_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 
 
 app = FastAPI(title="AkiDoDo Public Board API")
+
+# FIX 1: CORS — было захардкожено на старый preview URL, теперь открыто для всех.
+# allow_credentials=False обязателен при allow_origins=["*"].
+# Для этого публичного API (без cookies) это безопасно.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "https://akidodo-frontend-e5ydx57em-lssmlbb1-9638s-projects.vercel.app"],
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -290,6 +294,31 @@ async def handle_public_message(message: dict[str, Any]) -> None:
     await answer(PUBLIC_BOT_TOKEN, chat_id, "Сообщение передано автору.")
 
 
+# FIX 2: Пропуск накопленных сообщений при холодном старте.
+# Если offset = 0 (свежая БД после перезапуска), получаем последний update_id
+# и сохраняем его как стартовую точку — все старые сообщения игнорируются.
+async def clear_pending_updates(token: str, setting_key: str) -> None:
+    if get_setting(setting_key, "0") != "0":
+        return  # offset уже есть — всё хорошо, бот помнит где остановился
+    try:
+        result = await telegram_api(
+            token, "getUpdates", {"offset": -1, "limit": 1, "timeout": 0}
+        )
+        updates = result.get("result", [])
+        if updates:
+            latest_id = updates[-1]["update_id"]
+            # Подтверждаем Telegram что прочитали до latest_id
+            await telegram_api(
+                token, "getUpdates", {"offset": latest_id + 1, "limit": 1, "timeout": 0}
+            )
+            set_setting(setting_key, str(latest_id))
+            print(f"[{setting_key}] Пропущены накопленные сообщения, старт с update_id {latest_id + 1}")
+        else:
+            print(f"[{setting_key}] Нет накопленных сообщений")
+    except Exception as exc:
+        print(f"[{setting_key}] clear_pending_updates error: {exc}")
+
+
 async def poll_bot(token: str, setting_key: str, handler, edit_handler=None) -> None:
     while True:
         try:
@@ -306,21 +335,39 @@ async def poll_bot(token: str, setting_key: str, handler, edit_handler=None) -> 
                 elif edit_handler and "edited_message" in update:
                     await edit_handler(update["edited_message"])
         except Exception as exc:
+            err_str = str(exc)
             print(f"Telegram polling error for {setting_key}: {exc}")
-            await asyncio.sleep(5)
+            # FIX 3: При 409 (два экземпляра бота) ждём дольше чтобы старый успел остановиться
+            if "409" in err_str:
+                print(f"[{setting_key}] 409 Conflict — другой экземпляр ещё работает, жду 30 сек...")
+                await asyncio.sleep(30)
+            else:
+                await asyncio.sleep(5)
 
 
 @app.on_event("startup")
 async def on_startup() -> None:
     init_db()
     if OWNER_BOT_TOKEN and OWNER_CHAT_ID:
-        asyncio.create_task(poll_bot(OWNER_BOT_TOKEN, "owner_bot_offset", handle_owner_message, handle_owner_edit))
+        await clear_pending_updates(OWNER_BOT_TOKEN, "owner_bot_offset")
+        asyncio.create_task(
+            poll_bot(OWNER_BOT_TOKEN, "owner_bot_offset", handle_owner_message, handle_owner_edit)
+        )
     if PUBLIC_BOT_TOKEN and OWNER_CHAT_ID:
-        asyncio.create_task(poll_bot(PUBLIC_BOT_TOKEN, "public_bot_offset", handle_public_message))
+        await clear_pending_updates(PUBLIC_BOT_TOKEN, "public_bot_offset")
+        asyncio.create_task(
+            poll_bot(PUBLIC_BOT_TOKEN, "public_bot_offset", handle_public_message)
+        )
 
 
 class ManualPost(BaseModel):
     content: str
+
+
+# FIX 4: Корневой маршрут GET / — UptimeRobot и Render health-check ожидают 200, а не 404
+@app.get("/")
+def root() -> dict[str, str]:
+    return {"status": "ok", "service": "AkiDoDo Backend"}
 
 
 @app.get("/posts")
